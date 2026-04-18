@@ -1,4 +1,5 @@
 import json
+import sys
 import time
 import argparse
 from datetime import datetime
@@ -6,11 +7,16 @@ from datetime import datetime
 import requests
 
 from db import init_db, get_conn
+from villages import VILLAGES
+
+# Windows' default cp1252 stdout can't print Georgian village names.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 API_URL = "https://naprweb.reestri.gov.ge/api/search"
-SEARCH_ADDRESS = "წინამძღვრიანთკარი"
 RELEVANCE_KEYWORD = "საკუთრების უფლების რეგისტრაცია"
 REQUEST_DELAY_SECONDS = 1.0     # be polite to the server
+REQUEST_TIMEOUT_SECONDS = 60    # date-filtered queries are notably slower
 MAX_PAGES_SAFETY = 500          # hard ceiling to prevent runaway loops
 
 HEADERS = {
@@ -22,13 +28,20 @@ HEADERS = {
 }
 
 
-def fetch_page(page: int) -> dict:
+def _to_api_date(iso: str | None) -> str | None:
+    # API wants day-first DD.MM.YYYY; ISO YYYY-MM-DD returns HTTP 500.
+    if not iso:
+        return None
+    return datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+
+def fetch_page(page: int, village: str, date_from: str | None) -> dict:
     payload = {
         "page": page, "search": "", "regno": "",
-        "datefrom": None, "dateto": None,
-        "person": "", "address": SEARCH_ADDRESS, "cadcode": "",
+        "datefrom": _to_api_date(date_from), "dateto": None,
+        "person": "", "address": village, "cadcode": "",
     }
-    r = requests.post(API_URL, json=payload, headers=HEADERS, timeout=30)
+    r = requests.post(API_URL, json=payload, headers=HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
     r.raise_for_status()
     return r.json()
 
@@ -37,7 +50,7 @@ def is_relevant(web_transact: str | None) -> bool:
     return RELEVANCE_KEYWORD in (web_transact or "")
 
 
-def row_from_api(raw: dict) -> dict:
+def row_from_api(raw: dict, village: str) -> dict:
     return {
         "app_id":          raw["appID"],
         "reg_number":      raw["regNumber"],
@@ -50,18 +63,20 @@ def row_from_api(raw: dict) -> dict:
         "applicants_json": json.dumps(raw.get("applicants", []), ensure_ascii=False),
         "is_relevant":     1 if is_relevant(raw.get("webTransact")) else 0,
         "raw_json":        json.dumps(raw, ensure_ascii=False),
+        "village":         village,
     }
 
 
+# village is set on INSERT only; on conflict it's left alone (frozen at first-seen).
 UPSERT_SQL = """
 INSERT INTO registrations (
     app_id, reg_number, web_transact, status, status_id,
     address, app_reg_date, last_act_date, applicants_json,
-    is_relevant, raw_json
+    is_relevant, raw_json, village
 ) VALUES (
     :app_id, :reg_number, :web_transact, :status, :status_id,
     :address, :app_reg_date, :last_act_date, :applicants_json,
-    :is_relevant, :raw_json
+    :is_relevant, :raw_json, :village
 )
 ON CONFLICT(app_id) DO UPDATE SET
     status          = excluded.status,
@@ -91,44 +106,60 @@ def upsert_rows(conn, rows):
     return new_count, updated_count
 
 
-def scrape(max_pages: int | None):
-    """max_pages=None means 'keep going until we get an empty page'."""
-    init_db()
+def scrape_village(conn, village: str, date_from: str | None, max_pages: int | None):
     total_new = total_updated = 0
     ceiling = max_pages if max_pages is not None else MAX_PAGES_SAFETY
+    header = f"=== {village}"
+    if date_from:
+        header += f" (from {date_from})"
+    header += f" — up to {ceiling} page(s) ==="
+    print(f"\n{header}")
 
-    with get_conn() as conn:
-        for page in range(1, ceiling + 1):
+    for page in range(1, ceiling + 1):
+        try:
+            data = fetch_page(page, village, date_from)
+        except requests.RequestException as e:
+            print(f"  [warn] page {page} failed: {e} — sleeping 5s and retrying")
+            time.sleep(5)
             try:
-                data = fetch_page(page)
-            except requests.RequestException as e:
-                print(f"  [warn] page {page} failed: {e} — sleeping 5s and retrying")
-                time.sleep(5)
-                try:
-                    data = fetch_page(page)
-                except requests.RequestException as e2:
-                    print(f"  [error] page {page} failed twice: {e2} — stopping")
-                    break
-
-            applist = data.get("applist", [])
-            if not applist:
-                print(f"  page {page}: empty, stopping")
+                data = fetch_page(page, village, date_from)
+            except requests.RequestException as e2:
+                print(f"  [error] page {page} failed twice: {e2} — stopping this village")
                 break
 
-            rows = [row_from_api(r) for r in applist]
-            n, u = upsert_rows(conn, rows)
-            total_new += n
-            total_updated += u
+        applist = data.get("applist", [])
+        if not applist:
+            print(f"  page {page}: empty, stopping")
+            break
 
-            # Print every page in small runs; every 10th page in long backfills
-            if max_pages is None and page % 10 != 0 and n + u == 0:
-                pass  # stay quiet on long backfills with no changes
-            else:
-                print(f"  page {page}: {len(rows)} fetched, {n} new, {u} updated")
+        rows = [row_from_api(r, village) for r in applist]
+        n, u = upsert_rows(conn, rows)
+        total_new += n
+        total_updated += u
 
-            time.sleep(REQUEST_DELAY_SECONDS)
+        # Print every page in small runs; every 10th page in long backfills
+        if max_pages is None and page % 10 != 0 and n + u == 0:
+            pass  # stay quiet on long backfills with no changes
+        else:
+            print(f"  page {page}: {len(rows)} fetched, {n} new, {u} updated")
 
-    print(f"\nDone. {total_new} new, {total_updated} updated.")
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    return total_new, total_updated
+
+
+def scrape(max_pages: int | None):
+    """max_pages=None means 'keep going until empty'. Applies per village."""
+    init_db()
+    grand_new = grand_updated = 0
+    with get_conn() as conn:
+        for v in VILLAGES:
+            n, u = scrape_village(conn, v["name"], v.get("date_from"), max_pages)
+            grand_new += n
+            grand_updated += u
+
+    print(f"\nDone. {grand_new} new, {grand_updated} updated "
+          f"across {len(VILLAGES)} village(s).")
 
 
 def inspect():
@@ -140,6 +171,16 @@ def inspect():
         ).fetchone()["c"]
         print(f"Total records:    {total}")
         print(f"Relevant (ownership registrations): {relevant}")
+
+        print("\nBy village:")
+        rows = conn.execute("""
+            SELECT COALESCE(village, '(null)') AS village,
+                   COUNT(*) AS n,
+                   SUM(is_relevant) AS relevant
+            FROM registrations GROUP BY village ORDER BY n DESC
+        """).fetchall()
+        for r in rows:
+            print(f"  {r['village']}: {r['n']} total, {r['relevant']} relevant")
 
         print("\nBy year (relevant only, based on last_act_date):")
         rows = conn.execute("""
@@ -154,14 +195,14 @@ def inspect():
 
         print("\n5 most recent relevant registrations:")
         rows = conn.execute("""
-            SELECT reg_number, address,
+            SELECT reg_number, village, address,
                    datetime(last_act_date, 'unixepoch') AS completed_at
             FROM registrations
             WHERE is_relevant = 1
             ORDER BY last_act_date DESC LIMIT 5
         """).fetchall()
         for r in rows:
-            print(f"  {r['reg_number']} | {r['completed_at']} | {r['address']}")
+            print(f"  {r['reg_number']} | {r['completed_at']} | {r['village']} | {r['address']}")
 
 
 if __name__ == "__main__":
